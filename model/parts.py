@@ -38,46 +38,25 @@ class Down(nn.Module):
         return self.maxpool_conv(x)
 
 
-class ASPP(nn.Module):
-    def __init__(self, in_channel, depth):
-        super(ASPP,self).__init__()
-        # global average pooling : init nn.AdaptiveAvgPool2d ;also forward torch.mean(,,keep_dim=True)
-        self.mean = nn.AdaptiveAvgPool2d((1, 1))
-        self.conv = nn.Conv2d(in_channel, depth, 1, 1)
-        # k=1 s=1 no pad
-        self.atrous_block1 = nn.Conv2d(in_channel, depth, 1, 1)
-        self.atrous_block6 = nn.Conv2d(in_channel, depth, 3, 1, padding=6, dilation=6)
-        self.atrous_block12 = nn.Conv2d(in_channel, depth, 3, 1, padding=12, dilation=12)
-        self.atrous_block18 = nn.Conv2d(in_channel, depth, 3, 1, padding=18, dilation=18)
- 
-        self.conv_1x1_output = nn.Conv2d(depth * 5, depth, 1, 1)
- 
+class SA_Block(nn.Module):
+    def __init__(self, in_channel, kernel_size=7):
+        super(SA_Block, self).__init__()
+        # assert kernel_size in (5, 7), 'kernel size must be 3 or 7'
+        padding = 2 if kernel_size == 5 else 3
+        self.conv = nn.Conv2d(3, 1, kernel_size=kernel_size, padding=padding, bias=False)
+        # self.conv = nn.Conv2d(3, 1, kernel_size=kernel_size, padding=padding)
+        self.conv1 = nn.Conv2d(in_channel, 1, 1, 1)
+        self.bn = nn.BatchNorm2d(1)
+
     def forward(self, x):
-        size = x.shape[2:]
- 		# mean.shape = torch.Size([8, 3, 1, 1])
-        image_features = self.mean(x)
-        # conv.shape = torch.Size([8, 3, 1, 1])
-        image_features = self.conv(image_features)
-        # upsample.shape = torch.Size([8, 3, 32, 32])
-        image_features = F.upsample(image_features, size=size, mode='bilinear')
- 		
- 		# block1.shape = torch.Size([8, 3, 32, 32])
-        atrous_block1 = self.atrous_block1(x)
- 		
- 		# block6.shape = torch.Size([8, 3, 32, 32])
-        atrous_block6 = self.atrous_block6(x)
- 		
- 		# block12.shape = torch.Size([8, 3, 32, 32])
-        atrous_block12 = self.atrous_block12(x)
- 		
- 		# block18.shape = torch.Size([8, 3, 32, 32])
-        atrous_block18 = self.atrous_block18(x)
- 		
- 		# torch.cat.shape = torch.Size([8, 15, 32, 32])
- 		# conv_1x1.shape = torch.Size([8, 3, 32, 32])
-        net = self.conv_1x1_output(torch.cat([image_features, atrous_block1, atrous_block6,
-                                              atrous_block12, atrous_block18], dim=1))
-        return net
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        image_features = self.conv1(x)
+        out = torch.cat([image_features, avg_out, max_out], dim=1)
+        out = self.conv(out)
+        out = self.bn(out) 
+        scale = x * torch.sigmoid(out)
+        return scale
 
 class SE_Block(nn.Module):
     def __init__(self, ch_in, reduction=16):
@@ -107,11 +86,7 @@ class Up_NonLocal(nn.Module):
 
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
-        # else:
-        # self.up = nn.ConvTranspose2d(in_channels//2, in_channels//2, kernel_size=2, stride=2)
-        # self.conv = DoubleConv(in_channels, out_channels)
-        #先分别把encode和decode的特征图做空间注意力，然后将两个图contect，在做通道注意力
-        self.aspp_att = ASPP(in_channels//2, in_channels//2)
+        self.aspp_att = SA_Block(in_channels//2, kernel_size=7)
         self.se_att = SE_Block(in_channels)
 
     def forward(self, x1, x2):
@@ -122,10 +97,6 @@ class Up_NonLocal(nn.Module):
 
         x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
                         diffY // 2, diffY - diffY // 2])
-        # if you have padding issues, see
-        # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
-        # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
-        # x = torch.cat([x2, x1], dim=1)
         dec_att = self.aspp_att(x1)
         enc_att = self.aspp_att(x2)
         all_cat = torch.cat([dec_att, enc_att], dim=1)
